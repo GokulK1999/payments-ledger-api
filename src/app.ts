@@ -1,9 +1,21 @@
 import express, { NextFunction, Request, RequestHandler, Response } from "express";
 import { pool } from "./db";
-import { LedgerError, transfer } from "./ledger";
+import { LedgerError, findFundingAccount, transfer } from "./ledger";
+import webhooksRouter from "./webhooks";
+import iso20022Router from "./iso20022";
 
 const app = express();
-app.use(express.json());
+
+// Keep the exact bytes of JSON bodies: webhook signatures are calculated over the raw body.
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      (req as Request & { rawBody?: Buffer }).rawBody = buf;
+    },
+  })
+);
+// ISO 20022 messages are XML.
+app.use(express.text({ type: ["application/xml", "text/xml"], limit: "100kb" }));
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -108,19 +120,13 @@ app.post(
       return res.status(400).json({ error: "invalid account id" });
     }
     const { amount_minor, description } = req.body ?? {};
-    const funding = await pool.query(
-      `SELECT f.id FROM accounts f
-       WHERE f.allow_negative = true
-         AND f.currency = (SELECT currency FROM accounts WHERE id = $1)
-       LIMIT 1`,
-      [id]
-    );
-    if (funding.rows.length === 0) {
+    const fundingId = await findFundingAccount(id);
+    if (!fundingId) {
       return res.status(404).json({ error: "account not found or no funding source for its currency" });
     }
     const result = await transfer({
       idempotencyKey: key,
-      fromAccountId: funding.rows[0].id,
+      fromAccountId: fundingId,
       toAccountId: id,
       amountMinor: amount_minor,
       description: typeof description === "string" ? description : "deposit",
@@ -129,9 +135,18 @@ app.post(
   })
 );
 
+// Signed webhooks and ISO 20022 messages (see src/webhooks.ts and src/iso20022.ts)
+app.use(webhooksRouter);
+app.use(iso20022Router);
+
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof LedgerError) {
     return res.status(err.status).json({ error: err.message });
+  }
+  // Malformed JSON bodies and oversized bodies are the sender's fault, not a server error.
+  const status = (err as Error & { status?: number }).status;
+  if (status && status >= 400 && status < 500) {
+    return res.status(status).json({ error: "invalid request body" });
   }
   console.error(err);
   res.status(500).json({ error: "internal server error" });

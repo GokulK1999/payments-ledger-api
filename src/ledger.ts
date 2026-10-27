@@ -136,3 +136,16 @@ export async function transfer(input: TransferInput): Promise<TransferResult> {
     client.release();
   }
 }
+
+// Finds the External Funding account that matches an account's currency.
+// Returns null if the account doesn't exist or no funding account exists for its currency.
+export async function findFundingAccount(accountId: string): Promise<string | null> {
+  const { rows } = await pool.query(
+    `SELECT f.id FROM accounts f
+     WHERE f.allow_negative = true
+       AND f.currency = (SELECT currency FROM accounts WHERE id = $1)
+     LIMIT 1`,
+    [accountId]
+  );
+  return rows.length === 0 ? null : rows[0].id;
+}
